@@ -114,8 +114,7 @@ RUN set -eux; \
     vcs import < panda_ros2_gazebo/workspace.repos
 
 ### Add entrypoint
-COPY ./docker/entrypoint.bash ./docker/entrypoint.bash
-RUN chmod +x ./docker/entrypoint.bash
+COPY ./docker/entrypoint.bash ${PANDA_ROS2_GAZEBO_DIR}/entrypoint.bash
+RUN chmod +x ${PANDA_ROS2_GAZEBO_DIR}/entrypoint.bash
 
-ENTRYPOINT ["/bin/bash", "entrypoint.bash"]
 CMD ["/bin/bash"]
