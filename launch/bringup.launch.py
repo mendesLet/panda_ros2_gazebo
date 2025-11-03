@@ -14,7 +14,7 @@ def generate_launch_description():
         "config",
         "params.yaml"
     )
-    
+
     panda_node = launch_ros.actions.Node(
         package='panda_ros2_gazebo',
         executable='panda',
@@ -24,7 +24,7 @@ def generate_launch_description():
             {'share_dir' : pkg_share}
         ],
         output='screen',
-        arguments=['mode', name]
+        arguments=['--mode', name]
     )
 
     return launch.LaunchDescription([

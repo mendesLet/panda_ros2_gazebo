@@ -1,383 +1,346 @@
-# Copyright (C) 2021 Bosch LLC CR, North America. All rights reserved.
-# This software may be modified and distributed under the terms of the
-# GNU Lesser General Public License v2.1 or any later version.
+# Fixed Panda pick-and-place with proper Gazebo spawn and robust state machine.
 
 import enum
 import copy
+from typing import List, Optional
+
 import numpy as np
-from typing import List
 from scipy.spatial.transform import Rotation as R
 
-# ROS2 Python API libraries
 import rclpy
 from rclpy.node import Node
 
-# ROS2 message and service data structures
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
-# Panda kinematic model
-from .scripts.models.panda import Panda, FingersAction
+from geometry_msgs.msg import Pose
+from gazebo_msgs.srv import SpawnEntity
 
-# Helper class for RViz visualization
+from .scripts.models.panda import Panda, FingersAction
 from .helpers.rviz_helper import RVizHelper
 
-# For spawning entities into Gazebo
-from geometry_msgs.msg import Pose
-from gazebo_msgs.srv import SpawnEntity, GetEntityState, SetEntityState
-from rclpy.task import Future
 
-MODEL_DATABASE_TEMPLATE = """\
-<sdf version="1.4">
-    <world name="default">
-        <include>
-            <uri>model://{}</uri>
-        </include>
-    </world>
+def sdf_unit_box(name: str, size: float, mass: float = 0.05) -> str:
+    # Primitive SDF model. No dependency on GAZEBO_MODEL_PATH.
+    ix = iy = iz = (1.0/12.0) * mass * (2*(size**2))  # rough inertia for a cube
+    return f"""<?xml version='1.0'?>
+<sdf version='1.6'>
+  <model name='{name}'>
+    <static>false</static>
+    <link name='link'>
+      <pose>0 0 0 0 0 0</pose>
+      <inertial>
+        <mass>{mass}</mass>
+        <inertia>
+          <ixx>{ix}</ixx><iyy>{iy}</iyy><izz>{iz}</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name='col'>
+        <geometry><box><size>{size} {size} {size}</size></box></geometry>
+        <surface><friction><ode><mu>0.8</mu><mu2>0.8</mu2></ode></friction></surface>
+      </collision>
+      <visual name='vis'>
+        <geometry><box><size>{size} {size} {size}</size></box></geometry>
+        <material>
+          <ambient>0.7 0.5 0.3 1</ambient>
+          <diffuse>0.7 0.5 0.3 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
 </sdf>"""
 
-class StateMachineAction(enum.Enum):
 
-    GRAB = enum.auto() # activate the gripper; grab the box
-    DELIVER = enum.auto() # take the box from the starting destination to the delivery destination
-    RELEASE = enum.auto() # drop the box
-    HOVER = enum.auto() # hover over the box
-    HOME = enum.auto() # return to the home/neutal orientation
+class State(enum.Enum):
+    HOME = 0
+    HOVER = 1
+    GRAB = 2
+    DELIVER = 3
 
-def check_service_call_completed(node: Node, response: Future):
-    rclpy.spin_until_future_complete(node, response)
-    if response.result() is not None:
-        print('RESPONSE: %r' % response.result())
 
-        return response.result()
-    else:
-        raise RuntimeError(
-            'EXCEPTION WHILE CALLING SERVICE: %r' % response.exception())
+def quat_y(deg: float):
+    q = R.from_euler("y", deg, degrees=True).as_quat()
+    return q[0], q[1], q[2], q[3]
+
 
 class PandaPickAndPlace(Node):
     def __init__(self):
-        super().__init__('panda')
+        super().__init__("panda")
 
-        # Declare parameters that are loaded from params.yaml to the parameter server
+        # Parameters with safe defaults
         self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('control_dt', None),
-                ('joint_controller_name', None),
-                ('joint_control_topic', None),
-                ('end_effector_target_topic', None),
-                ('end_effector_pose_topic', None),
-                ('model_file', None),
-                ('base_frame', None),
-                ('end_effector_frame', None),
-                ('arm_joint_tag', None),
-                ('finger_joint_tag', None),
-                ('initial_joint_angles', None),
-                ('share_dir', None)
-            ]
+            "",
+            [
+                ("control_dt", 0.01),
+                ("joint_control_topic", "/panda_arm_controller/joint_commands"),
+                ("end_effector_target_topic", "/panda/ee_target"),
+                ("end_effector_pose_topic", "/panda/ee_pose"),
+                ("base_frame", "panda_link0"),
+                ("end_effector_frame", "panda_link8"),
+                ("publish_fingers", True),            # set False for 7-DOF controllers
+                ("reach_pos_tol", 0.05),
+                ("max_wait_ticks", 200),
+                ("spawn_reference_frame", "world"),   # use 'world' unless you publish TF to base
+                ("cube_size", 0.05),
+                ("share_dir", None),
+                ("model_file", None),
+                ("arm_joint_tag", None),
+                ("finger_joint_tag", None),
+                ("initial_joint_angles", None),
+            ],
         )
 
-        # Timestep counter for how much time the robot should wait before transitioning to the next state.
-        self._wait = 0
-        self._max_wait = 200
+        self._dt = float(self.get_parameter("control_dt").value)
+        self._pub_fingers = bool(self.get_parameter("publish_fingers").value)
+        self._tol = float(self.get_parameter("reach_pos_tol").value)
+        self._max_wait = int(self.get_parameter("max_wait_ticks").value)
+        self._base_frame = self.get_parameter("base_frame").value
+        self._spawn_ref = self.get_parameter("spawn_reference_frame").value
+        self._cube_size = float(self.get_parameter("cube_size").value)
 
-        # Create joint commands, end effector publishers; subscribe to joint state
-        self._joint_commands_publisher = self.create_publisher(Float64MultiArray, self.get_parameter('joint_control_topic').value, 10)
-        self._end_effector_target_publisher = self.create_publisher(Odometry, self.get_parameter('end_effector_target_topic').value, 10)
-        self._end_effector_pose_publisher = self.create_publisher(Odometry, self.get_parameter('end_effector_pose_topic').value, 10)
-        self._joint_states_subscriber = self.create_subscription(JointState, '/joint_states', self.callback_joint_states, 10)
-        self._control_dt = self.get_parameter('control_dt').value
-        base_link_frame = self.get_parameter('base_frame').value
+        # Publishers/subscribers
+        self._pub_cmd = self.create_publisher(Float64MultiArray, self.get_parameter("joint_control_topic").value, 10)
+        self._pub_target = self.create_publisher(Odometry, self.get_parameter("end_effector_target_topic").value, 10)
+        self._pub_pose = self.create_publisher(Odometry, self.get_parameter("end_effector_pose_topic").value, 10)
+        self._sub_js = self.create_subscription(JointState, "/joint_states", self._on_js, 10)
 
+        # Gazebo spawn service
+        self._spawn_cli = self.create_client(SpawnEntity, "/spawn_entity")
+
+        # Robot model and initial state
         self._panda = Panda(self)
-        self._num_joints = self._panda.num_joints
+        self._nj = self._panda.num_joints
+        self._js = JointState()
+        self._js.position = list(self._panda.reset_model())
+        self._js.velocity = [0.0] * self._nj
+        self._js.effort = [0.0] * self._nj
 
-        self._joint_states: JointState = JointState()
-        self._joint_states.velocity = [0.] * self._num_joints
-        self._joint_states.effort = [0.] * self._num_joints
+        self._joint_targets: List[float] = list(self._js.position)
+        self._publish_cmd(self._joint_targets)
 
-        # Publish initial joint states target
-        self._joint_states.position = self._panda.reset_model()
+        self._ee_current: Odometry = self._panda.solve_fk(self._js, remap=False)
+        self._ee_target: Odometry = copy.deepcopy(self._ee_current)
+        qx, qy, qz, qw = quat_y(90.0)
+        self._ee_target.pose.pose.orientation.x = qx
+        self._ee_target.pose.pose.orientation.y = qy
+        self._ee_target.pose.pose.orientation.z = qz
+        self._ee_target.pose.pose.orientation.w = qw
+        self._ee_target_initial = copy.deepcopy(self._ee_target)
 
-        # Set an end effector target
-        self._end_effector_current = self._panda.solve_fk(self._joint_states, remap=False)
+        jt0 = self._safe_ik(self._ee_target)
+        if jt0 is not None:
+            self._joint_targets = jt0
 
-        self._end_effector_target: Odometry = copy.deepcopy(self._end_effector_current)
-        quat_xyzw = R.from_euler(seq="y", angles=90, degrees=True).as_quat()
-        self._end_effector_target.pose.pose.orientation.x = quat_xyzw[0]
-        self._end_effector_target.pose.pose.orientation.y = quat_xyzw[1]
-        self._end_effector_target.pose.pose.orientation.z = quat_xyzw[2]
-        self._end_effector_target.pose.pose.orientation.w = quat_xyzw[3]
-        self._initial_end_effector_target = copy.deepcopy(self._end_effector_target)
+        self._rviz = RVizHelper(self)
 
-        self._joint_targets: List[float] = self._panda.solve_ik(self._end_effector_target)
-        self._joint_targets_finish: List[float] = self._joint_targets.copy()
-        self._joint_targets_start: List[float] = self._joint_targets.copy()
+        # State machine
+        self._state = State.HOME
+        self._wait = 0
 
-        # At the start, the fingers should be OPEN
-        self._joint_targets[-2:] = self._panda.move_fingers(self._joint_targets, FingersAction.OPEN)[-2:]
-
-        msg = Float64MultiArray()
-        msg.data = list(self._joint_targets.copy())
-        self._joint_commands_publisher.publish(msg)
-
-        # Create the RViz helper for visualizing the waypoints and trajectories
-        self._rviz_helper = RVizHelper(self)
-
-        # Save the current state of the state machine
-        self._state : StateMachineAction = StateMachineAction.HOME
-
-        # Declare service for spawning objects
-        self._spawn_model_client = self.create_client(SpawnEntity, '/spawn_entity')
-
-        self.get_logger().info("CONNECTING TO `/spawn_entity` SERVICE...")
-        if not self._spawn_model_client.service_is_ready():
-            self._spawn_model_client.wait_for_service()
-            self.get_logger().info("...CONNECTED!")
-        self.get_logger().info("[WARNING] ANY MODEL YOU WANT TO SPAWN USING THE GAZEBO `/spawn_entity` SERVICE MUST EXIST IN THE GAZEBO_MODEL_PATH VARIABLE, UNLESS AN ABSOLUTE PATH TO THE URDF IS PROVIDED.")
-
-        self._cube_pose: Pose = Pose()
-        self._cube_pose.position.x = 0.4 # [m]
-        self._cube_pose.position.y = 0.0 # [m]
-        self._cube_pose.position.z = 5/2 * 0.01 # [m]
+        # Cube bookkeeping
+        self._cube_pose = Pose()
+        self._cube_pose.position.x = 0.5
+        self._cube_pose.position.y = 0.0
+        self._cube_pose.position.z = self._cube_size / 2.0
         self._cube_pose.orientation.w = 1.0
 
-        # Initialize the cube spawn request
         self._cube_counter = 0
-        self._spawn_model_request: SpawnEntity.Request = SpawnEntity.Request()
-        self._spawn_model_request.xml = MODEL_DATABASE_TEMPLATE.format('wood_cube_5cm')
-        self._spawn_model_request.reference_frame = base_link_frame
 
-        self._set_model_state_client = self.create_client(SetEntityState, '/set_entity_state')
-        self._set_model_state_request: SetEntityState.Request = SetEntityState.Request()
-        # TODO: SetEntityState not working
-        # if not result.success:
-        #     self._set_model_state_request.state.pose = copy.deepcopy(self._cube_pose)
-        #     self._set_model_state_request.state.name = "cube"
-        #     self._set_model_state_request.state.reference_frame = base_link_frame
-        #     response = self._set_model_state_client.call_async(self._set_model_state_request)
-        #     result = check_service_call_completed(self, response)
+        self.get_logger().info(f"Spawn reference frame: {self._spawn_ref}")
 
-    def callback_joint_states(self, joint_states):
+    # ---------- Helpers ----------
 
-        self._joint_states = joint_states
-        self._panda.set_joint_states(self._joint_states)
+    def _publish_cmd(self, joints: List[float]) -> None:
+        cmd = joints[:7] if not self._pub_fingers else joints[: self._nj]
+        msg = Float64MultiArray()
+        msg.data = list(map(float, cmd))
+        self._pub_cmd.publish(msg)
 
-        # Calculate the end effector location relative to the base from forward kinematics
-        self._end_effector_current = self._panda.solve_fk(self._joint_states)
+    def _safe_ik(self, ee: Odometry) -> Optional[List[float]]:
+        jt = self._panda.solve_ik(ee)
+        if jt is None:
+            self.get_logger().warn("IK failed: None")
+            return None
+        arr = np.asarray(jt, dtype=float)
+        if arr.shape[0] != self._nj:
+            self.get_logger().warn(f"IK bad length {arr.shape[0]} != {self._nj}")
+            return None
+        if not np.all(np.isfinite(arr)):
+            self.get_logger().warn("IK non-finite")
+            return None
+        return list(arr)
 
-        self.get_next_target() # cycle target to next action in state machine
+    def _reached(self, tol: float) -> bool:
+        p = np.array(
+            [
+                self._ee_current.pose.pose.position.x,
+                self._ee_current.pose.pose.position.y,
+                self._ee_current.pose.pose.position.z,
+            ],
+            dtype=float,
+        )
+        t = np.array(
+            [
+                self._ee_target.pose.pose.position.x,
+                self._ee_target.pose.pose.position.y,
+                self._ee_target.pose.pose.position.z,
+            ],
+            dtype=float,
+        )
+        if not (np.all(np.isfinite(p)) and np.all(np.isfinite(t))):
+            return False
+        return np.linalg.norm(p - t) < tol
 
-        # Publish the end effector target and odometry messages
-        self._end_effector_target_publisher.publish(self._end_effector_target)
-        self._end_effector_pose_publisher.publish(self._end_effector_current)
+    def _spawn_cube(self):
+        # Build SDF at call time. Independent of model database.
+        name = f"cube_{self._cube_counter}"
+        xml = sdf_unit_box(name, size=self._cube_size)
 
-        # Update the RViz helper and publish
-        self._rviz_helper.publish(self._end_effector_current)
+        req = SpawnEntity.Request()
+        req.name = name
+        req.xml = xml
+        req.robot_namespace = ""  # optional
+        req.reference_frame = self._spawn_ref
+        req.initial_pose = copy.deepcopy(self._cube_pose)
 
-        self.joint_group_position_controller_callback()
+        if not self._spawn_cli.service_is_ready():
+            self._spawn_cli.wait_for_service()
 
-    def end_effector_reached(self,
-                            max_error_pos: float = 0.05,
-                            max_error_rot: float = 0.05,
-                            max_error_vel: float = 0.1,
-                            mask: np.ndarray = np.array([1., 1., 1.])) -> bool:
+        self._spawn_cli.call_async(req)  # do not block
+        self._cube_counter += 1
+        self.get_logger().info(f"Spawn requested: {name} at "
+                               f"({req.initial_pose.position.x:.3f}, "
+                               f"{req.initial_pose.position.y:.3f}, "
+                               f"{req.initial_pose.position.z:.3f}) in {self._spawn_ref}")
 
-        # Check the position to see if the target has been reached
-        position = np.array([
-            self._end_effector_current.pose.pose.position.x,
-            self._end_effector_current.pose.pose.position.y,
-            self._end_effector_current.pose.pose.position.z])
-        velocity = np.array([
-            self._end_effector_current.twist.twist.linear.x,
-            self._end_effector_current.twist.twist.linear.y,
-            self._end_effector_current.twist.twist.linear.z,
-            self._end_effector_current.twist.twist.angular.x,
-            self._end_effector_current.twist.twist.angular.y,
-            self._end_effector_current.twist.twist.angular.z])
-        target = np.array([
-            self._end_effector_target.pose.pose.position.x,
-            self._end_effector_target.pose.pose.position.y,
-            self._end_effector_target.pose.pose.position.z])
+    # ---------- ROS callbacks ----------
 
-        masked_target = mask * target
-        masked_current = mask * position
+    def _on_js(self, js: JointState):
+        if not js.position:
+            return
+        self._js = js
+        self._panda.set_joint_states(self._js)
+        self._ee_current = self._panda.solve_fk(self._js)
 
-        end_effector_reached = (np.linalg.norm(masked_current - masked_target) < max_error_pos) and \
-            (np.linalg.norm(velocity[:3]) < max_error_vel)
+        self._tick_sm()
 
-        return end_effector_reached
+        self._pub_target.publish(self._ee_target)
+        self._pub_pose.publish(self._ee_current)
+        self._rviz.publish(self._ee_current)
 
-    def joint_group_position_controller_callback(self) -> None:
+        self._publish_cmd(self._joint_targets)
 
-        if self._state == StateMachineAction.DELIVER or self._state == StateMachineAction.GRAB:
+    # ---------- State machine ----------
+
+    def _tick_sm(self):
+        HOVER_Z = 0.30
+        GRAB_Z = max(0.03, self._cube_size * 0.6)  # safe grasp height
+        STACK_X = 0.30
+        STACK_Y = 0.50
+
+        # keep gripper policy
+        if self._state in (State.GRAB, State.DELIVER):
             self._joint_targets[-2:] = self._panda.move_fingers(self._joint_targets, FingersAction.CLOSE)[-2:]
         else:
             self._joint_targets[-2:] = self._panda.move_fingers(self._joint_targets, FingersAction.OPEN)[-2:]
 
-        if self._wait > 2 * self._max_wait:
-            self._joint_targets[-2:] = self._panda.move_fingers(self._joint_targets, FingersAction.OPEN)[-2:]
+        # fix orientation
+        qx, qy, qz, qw = quat_y(90.0)
+        self._ee_target.pose.pose.orientation.x = qx
+        self._ee_target.pose.pose.orientation.y = qy
+        self._ee_target.pose.pose.orientation.z = qz
+        self._ee_target.pose.pose.orientation.w = qw
 
-        msg = Float64MultiArray()
-        msg.data = list(self._joint_targets)
-        self._joint_commands_publisher.publish(msg)
-
-    def sample_new_cube_pose(self):
-
-        # Sample new pose for the cube
-        random_position = np.random.uniform(low=[0.3, -0.10], high=[0.7, 0.30])
-        self._cube_pose.position.x = random_position[0]
-        self._cube_pose.position.y = random_position[1]
-        self._cube_pose.position.z = 0.03
-
-        # Spawn a new cube
-        self._spawn_model_request.name = "cube{}".format(str(self._cube_counter))
-        self._spawn_model_request.initial_pose = copy.deepcopy(self._cube_pose)
-        _ = self._spawn_model_client.call_async(self._spawn_model_request)
-
-        self._cube_counter += 1
-
-    def interp_joint_targets(self, joint_target: List[float], joint_targets_finish: List[float], joint_targets_start: List[float], num_steps):
-
-        return [jt + (jf - js) / (num_steps - 1) for jt, jf, js in zip(joint_target, joint_targets_finish, joint_targets_start)].copy()
-
-    def get_next_target(self):
-        hover_height = 0.30
-        box_height = 0.05
-        grab_height = 0.03
-
-        quat_xyzw = R.from_euler(seq="xyz", angles=[0, 90, 90], degrees=True).as_quat()
-        self._end_effector_target.pose.pose.orientation.x = quat_xyzw[0]
-        self._end_effector_target.pose.pose.orientation.y = quat_xyzw[1]
-        self._end_effector_target.pose.pose.orientation.z = quat_xyzw[2]
-        self._end_effector_target.pose.pose.orientation.w = quat_xyzw[3]
-
-        # If the current state is "HOME" position and the target location has been reached
-        if self._state == StateMachineAction.HOME and self.end_effector_reached():
-
+        if self._state == State.HOME:
             if self._wait < self._max_wait:
-                # Keep waiting
                 self._wait += 1
+                return
+            self._wait = 0
+            # randomize source pose and spawn
+            rp = np.random.uniform(low=[0.35, -0.10], high=[0.65, 0.30])
+            self._cube_pose.position.x = float(rp[0])
+            self._cube_pose.position.y = float(rp[1])
+            self._cube_pose.position.z = self._cube_size / 2.0
+            self._spawn_cube()
 
-            else:
-                self._wait = 0
-
-                # Go to the location where the box is and hover above it
-                self._state = StateMachineAction.HOVER
-
-                # Set the end effector target to the cube pose
-                self.sample_new_cube_pose()
-                self._end_effector_target.pose.pose.position = copy.deepcopy(self._cube_pose.position)
-                self._end_effector_target.pose.pose.position.y += 0.02
-                self._end_effector_target.pose.pose.position.z = hover_height # hover above the cube
-
-                self._joint_targets = self._panda.solve_ik(self._end_effector_target)
-
+            # target hover above cube
+            self._ee_target.pose.pose.position.x = self._cube_pose.position.x
+            self._ee_target.pose.pose.position.y = self._cube_pose.position.y
+            self._ee_target.pose.pose.position.z = HOVER_Z
+            jt = self._safe_ik(self._ee_target)
+            if jt is None:
+                return
+            self._joint_targets = jt
+            self._state = State.HOVER
+            self.get_logger().info("STATE → HOVER")
             return
 
-        if self._state == StateMachineAction.HOVER:
-
-            if self._wait == 0:
-                self._end_effector_target.pose.pose.position.z = grab_height
-
-                self._joint_targets_start = self._joint_targets.copy()
-                self._joint_targets_finish = self._panda.solve_ik(self._end_effector_target)
-
-            if self._wait < self._max_wait:
-                # Lower the gripper
-                self._end_effector_target.pose.pose.position.z = grab_height + (1 - self._wait/(self._max_wait-1)) * (hover_height - grab_height)
-
-                self._joint_targets = self.interp_joint_targets(self._joint_targets, self._joint_targets_finish, self._joint_targets_start, self._max_wait)
-
-                # Keep waiting
-                self._wait += 1
-            else:
-                self._wait = 0
-
-                # Pick up the box
-                self._state = StateMachineAction.GRAB
-
+        if self._state == State.HOVER:
+            if self._reached(self._tol):
+                self._ee_target.pose.pose.position.z = GRAB_Z
+                jt = self._safe_ik(self._ee_target)
+                if jt is not None:
+                    self._joint_targets = jt
+                    self._state = State.GRAB
+                    self._wait = 0
+                    self.get_logger().info("STATE → GRAB")
             return
 
-        if self._state == StateMachineAction.GRAB:
-
-            if self._wait == self._max_wait:
-                self._end_effector_target.pose.pose.position.z = hover_height
-
-                self._joint_targets_start = self._joint_targets.copy()
-                self._joint_targets_finish = self._panda.solve_ik(self._end_effector_target)
-
-            if self._wait < 2 * self._max_wait and self._wait >= self._max_wait:
-                # Raise the gripper
-                self._end_effector_target.pose.pose.position.z = grab_height + ((self._wait - self._max_wait)/(self._max_wait - 1)) * (hover_height - grab_height)
-
-                self._joint_targets = self.interp_joint_targets(self._joint_targets, self._joint_targets_finish, self._joint_targets_start, self._max_wait)
-
+        if self._state == State.GRAB:
+            # dwell then lift
             self._wait += 1
-
-            if self._wait == 2 * self._max_wait:
-                self._wait = 0
-
-                # Set the location for the delivery target
-                self._end_effector_target.pose.pose.position.x = 0.3
-                self._end_effector_target.pose.pose.position.y = 0.5
-                self._end_effector_target.pose.pose.position.z = max((self._cube_counter + 0.5) * box_height, hover_height)
-
-                self._joint_targets = self._panda.solve_ik(self._end_effector_target)
-
-                # Deliver the box to its location. Maybe hover above the location before dropping the box
-                self._state = StateMachineAction.DELIVER
-
+            if self._wait == self._max_wait:
+                self._ee_target.pose.pose.position.z = HOVER_Z
+                jt = self._safe_ik(self._ee_target)
+                if jt is not None:
+                    self._joint_targets = jt
+            if self._wait >= 2 * self._max_wait:
+                # move over stack area, keep high
+                self._ee_target.pose.pose.position.x = STACK_X
+                self._ee_target.pose.pose.position.y = STACK_Y
+                self._ee_target.pose.pose.position.z = HOVER_Z
+                jt = self._safe_ik(self._ee_target)
+                if jt is not None:
+                    self._joint_targets = jt
+                    self._state = State.DELIVER
+                    self._wait = 0
+                    self.get_logger().info("STATE → DELIVER")
             return
 
-        if self._state == StateMachineAction.DELIVER:
-            goal = (self._cube_counter - 0.5) * box_height
-            grab_height = goal + 0.25 * box_height
-            hover_height = goal + box_height
-
-            if self._wait == 0 and self.end_effector_reached():
-                self._end_effector_target.pose.pose.position.z = grab_height
-
-                self._joint_targets_start = self._joint_targets.copy()
-                self._joint_targets_finish = self._panda.solve_ik(self._end_effector_target)
-
-                self._wait += 1
-
-            if self._wait == 2 * self._max_wait:
-                self._end_effector_target.pose.pose.position.z = hover_height
-
-                self._joint_targets_start = self._joint_targets.copy()
-                self._joint_targets_finish = self._panda.solve_ik(self._end_effector_target)
-
-            if self._wait >= self._max_wait:
-                self._wait += 1
-
-            if self._wait < self._max_wait and self._wait > 0:
-                # Lower the gripper
-                self._end_effector_target.pose.pose.position.z = grab_height + (1 - self._wait/(self._max_wait-1)) * (hover_height - grab_height)
-
-                self._joint_targets = self.interp_joint_targets(self._joint_targets, self._joint_targets_finish, self._joint_targets_start, self._max_wait)
-
-                # Keep waiting
-                self._wait += 1
-
-            else:
-
-                if self._wait < 3 * self._max_wait and self._wait > self._max_wait * 2:
-                    # Raise the gripper
-                    self._end_effector_target.pose.pose.position.z = grab_height + ((self._wait - 2 * self._max_wait) / (self._max_wait - 1)) * (hover_height - grab_height)
-
-                    self._joint_targets = self.interp_joint_targets(self._joint_targets, self._joint_targets_finish, self._joint_targets_start, self._max_wait)
-
-            if self._wait == 3 * self._max_wait:
+        if self._state == State.DELIVER:
+            # descend to stack height then return home
+            stack_h = max(self._cube_size * (self._cube_counter - 0.5), self._cube_size * 0.5)
+            approach_z = stack_h + 0.5 * self._cube_size
+            if self._wait == 0 and self._reached(self._tol):
+                self._ee_target.pose.pose.position.z = approach_z
+                jt = self._safe_ik(self._ee_target)
+                if jt is not None:
+                    self._joint_targets = jt
+            self._wait += 1
+            if self._wait >= 3 * self._max_wait:
+                self._ee_target = copy.deepcopy(self._ee_target_initial)
+                jt = self._safe_ik(self._ee_target)
+                if jt is not None:
+                    self._joint_targets = jt
+                self._state = State.HOME
                 self._wait = 0
+                self.get_logger().info("STATE → HOME")
+            return
 
-                # Return to the home position and spawn the box in a new location
-                self._end_effector_target = copy.deepcopy(self._initial_end_effector_target)
 
-                self._joint_targets = self._panda.solve_ik(self._end_effector_target)
+def main(args=None):
+    rclpy.init(args=args)
+    node = PandaPickAndPlace()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
-                self._state = StateMachineAction.HOME
 
-                print("RETURNING TO HOME")
+if __name__ == "__main__":
+    main()
