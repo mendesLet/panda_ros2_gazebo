@@ -107,16 +107,15 @@ RUN sh -c 'echo "deb [arch=$(dpkg --print-architecture)] http://repo.ros2.org/ub
     rosdep update
 # Note: Do not remove apt lists until last ROS-based project is built
 
-### Clone this repository and import the repos required to build/run the project
-RUN mkdir -p ${PANDA_ROS2_GAZEBO_DIR} && \
-    cd ${PANDA_ROS2_GAZEBO_DIR}/.. && \
-    git clone https://github.com/nicholaspalomo/panda_ros2_gazebo.git && \
-    vcs import < panda_ros2_gazebo/workspace.repos && \
-    rm -rf /var/lib/apt/lists/*
+COPY . "${PANDA_ROS2_GAZEBO_DIR}/src/panda_ros2_gazebo"
+
+RUN set -eux; \
+    cd "${PANDA_ROS2_GAZEBO_DIR}/src"; \
+    vcs import < panda_ros2_gazebo/workspace.repos
 
 ### Add entrypoint
-COPY ./entrypoint.bash ./entrypoint.bash
-RUN chmod +x ./entrypoint.bash
+COPY ./docker/entrypoint.bash ./docker/entrypoint.bash
+RUN chmod +x ./docker/entrypoint.bash
 
 ENTRYPOINT ["/bin/bash", "entrypoint.bash"]
 CMD ["/bin/bash"]
