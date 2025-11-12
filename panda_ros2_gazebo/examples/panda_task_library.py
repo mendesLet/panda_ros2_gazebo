@@ -1,7 +1,8 @@
-# PandaTaskLibrary: topic-based task API for GO/PICK/PLACE/OPEN/CLOSE with IK guards and rate limiting.
-
+#!/usr/bin/env python3
+# panda_task_library_action.py
 import copy
 import enum
+import threading
 from collections import deque
 from typing import Deque, List, Optional, Tuple
 
@@ -10,10 +11,16 @@ from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.executors import MultiThreadedExecutor
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
+
+# Adjust this import to your package name if needed.
+# e.g., from manip_task_msgs.action import ManipTask
+from panda_task_msgs.action import ManipTask
 
 from .scripts.models.panda import Panda, FingersAction
 from .helpers.rviz_helper import RVizHelper
@@ -28,12 +35,13 @@ def quat_rpy_deg(rpy_deg: Tuple[float, float, float]):
 class Phase(enum.Enum):
     IDLE = 0
     GO = 1
-    PICK_DESCEND = 2
-    PICK_DWELL = 3
-    PICK_LIFT = 4
-    PLACE_DESCEND = 5
-    PLACE_OPEN = 6
-    PLACE_LIFT = 7
+    PICK_PREOPEN = 2
+    PICK_DESCEND = 3
+    PICK_DWELL = 4
+    PICK_LIFT = 5
+    PLACE_DESCEND = 6
+    PLACE_OPEN = 7
+    PLACE_LIFT = 8
 
 
 class PandaTaskLibrary(Node):
@@ -44,6 +52,7 @@ class PandaTaskLibrary(Node):
             "",
             [
                 ("control_dt", 0.01),
+                ("normal_open_width_m", 0.08),
                 ("joint_control_topic", "/panda_arm_controller/joint_commands"),
                 ("end_effector_target_topic", "/panda/ee_target"),
                 ("end_effector_pose_topic", "/panda/ee_pose"),
@@ -53,10 +62,16 @@ class PandaTaskLibrary(Node):
                 ("reach_pos_tol", 0.02),
                 ("home_rpy_deg", [0.0, 90.0, 0.0]),
                 ("home_xyz", [0.45, 0.0, 0.40]),
-                ("approach_ticks", 300),
-                ("grasp_dwell_ticks", 150),
-                ("preclose_offset", 0.010),
-                ("max_joint_vel", 0.4),
+                ("approach_ticks", 600),
+                ("grasp_dwell_ticks", 200),
+                ("preclose_offset", 0.005),
+                ("max_joint_vel", 0.15),
+                ("preopen_ticks", 120),
+                ("max_finger_joint_vel", 0.6),
+                ("pregrasp_pause_ticks", 30),          # short settle pause at bottom
+                ("close_on_actual_z", True),           # use measured EE z to decide when to close
+                ("grasp_close_speed_m_per_s", 0.01),   # per-finger speed (m/s) for gentle close
+                ("grasp_clearance_m", 0.004),          # squeeze below object size
 
                 # Required by Panda model:
                 ("share_dir", None),
@@ -64,6 +79,9 @@ class PandaTaskLibrary(Node):
                 ("arm_joint_tag", None),
                 ("finger_joint_tag", None),
                 ("initial_joint_angles", None),
+
+                # Action name
+                ("action_name", "manip_task"),
             ],
         )
 
@@ -77,6 +95,15 @@ class PandaTaskLibrary(Node):
         self._max_jstep = float(self.get_parameter("max_joint_vel").value) * self._dt
         self._home_xyz = [float(x) for x in self.get_parameter("home_xyz").value]
         self._home_rpy = [float(x) for x in self.get_parameter("home_rpy_deg").value]
+        self._action_name = self.get_parameter("action_name").value
+        self._preopen_ticks = int(self.get_parameter("preopen_ticks").value)
+        self._max_finger_jstep = float(self.get_parameter("max_finger_joint_vel").value) * self._dt
+        self._normal_open_width_m = float(self.get_parameter("normal_open_width_m").value)
+        self._pregrasp_pause = int(self.get_parameter("pregrasp_pause_ticks").value)
+        self._close_on_actual_z = bool(self.get_parameter("close_on_actual_z").value)
+        self._grasp_close_step = float(self.get_parameter("grasp_close_speed_m_per_s").value) * self._dt
+        self._grasp_clearance = float(self.get_parameter("grasp_clearance_m").value)
+
 
         # IO
         self._pub_cmd = self.create_publisher(
@@ -137,16 +164,52 @@ class PandaTaskLibrary(Node):
         self._place_xy = (self._home_xyz[0], self._home_xyz[1])
         self._rpy = self._home_rpy
 
+        # Action server state
+        self._active_goal_lock = threading.Lock()
+        self._active_goal_handle = None
+        self._action_done_evt = threading.Event()
+        self._last_status = ""
+
+        self._as = ActionServer(
+            self,
+            ManipTask,
+            self._action_name,
+            execute_callback=self._execute_cb,
+            goal_callback=self._goal_cb,
+            cancel_callback=self._cancel_cb,
+        )
+
         self._status("ready")
 
     # ---------- Utils ----------
 
     def _status(self, msg: str):
+        self._last_status = msg
         self._pub_status.publish(String(data=msg))
+        with self._active_goal_lock:
+            gh = self._active_goal_handle
+        if gh is not None:
+            fb = ManipTask.Feedback()
+            fb.status = msg
+            try:
+                gh.publish_feedback(fb)
+            except Exception:
+                pass
+            if msg.lower().startswith("done") or msg.startswith("ERR"):
+                self._action_done_evt.set()
 
     def _publish_cmd(self, joints: List[float]) -> None:
-        desired = np.array(joints[: (7 if not self._pub_fingers else self._nj)], dtype=float)
-        delta = np.clip(desired - self._cmd_prev, -self._max_jstep, self._max_jstep)
+        n = (7 if not self._pub_fingers else self._nj)
+        desired = np.array(joints[:n], dtype=float)
+
+        delta = desired - self._cmd_prev
+        # arm joints
+        if n >= 7:
+            delta[:7] = np.clip(delta[:7], -self._max_jstep, self._max_jstep)
+        # fingers (last two joints)
+        if self._pub_fingers and n >= 9:
+            delta[-2:] = np.clip(delta[-2:], -self._max_finger_jstep, self._max_finger_jstep)
+
         limited = self._cmd_prev + delta
         self._cmd_prev = limited.copy()
         self._pub_cmd.publish(Float64MultiArray(data=list(map(float, limited))))
@@ -198,6 +261,13 @@ class PandaTaskLibrary(Node):
         od.pose.pose.orientation.z = qz
         od.pose.pose.orientation.w = qw
         return od
+
+    def _set_gripper_open_width(self, total_width_m: float):
+        """
+        Open to an explicit total width (meters). For Franka, per-finger joint range is ~[0, 0.04] m.
+        """
+        per_finger = max(0.0, min(total_width_m * 0.5, 0.04))
+        self._joint_targets[-2:] = [per_finger, per_finger]
 
     def _set_gripper(self, act: FingersAction):
         self._joint_targets[-2:] = self._panda.move_fingers(self._joint_targets, act)[-2:]
@@ -275,10 +345,10 @@ class PandaTaskLibrary(Node):
                 self._status("exec HOME")
             elif name == "OPEN":
                 self._set_gripper(FingersAction.OPEN)
-                self._status("exec OPEN")
+                self._status("done OPEN")
             elif name == "CLOSE":
                 self._set_gripper(FingersAction.CLOSE)
-                self._status("exec CLOSE")
+                self._status("done CLOSE")
             elif name == "GO":
                 x, y, z, r, p, ydeg = args
                 self._start_go(x, y, z, [r, p, ydeg])
@@ -303,17 +373,33 @@ class PandaTaskLibrary(Node):
         if self._phase == Phase.PICK_DESCEND:
             w = min(1.0, self._tick / max(1, self._approach_ticks))
             self._joint_targets = self._lerp_joints(self._jt_start, self._jt_goal, w)
-            current_z = (1.0 - w) * self._hover_z + w * self._pick_z
-            if current_z <= self._pick_z + self._preclose_offset:
-                self._set_gripper(FingersAction.CLOSE)
             self._tick += 1
-            if self._tick >= self._approach_ticks:
+
+            reached_by_tick = (self._tick >= self._approach_ticks)
+            if self._close_on_actual_z:
+                z_now = float(self._ee_current.pose.pose.position.z)
+                at_bottom = (z_now <= self._pick_z + self._preclose_offset)
+            else:
+                at_bottom = reached_by_tick
+
+            if at_bottom:
+                self._phase = Phase.PICK_PREOPEN  # reuse this slot for a short settle pause
+                self._tick = 0
+            return
+
+        if self._phase == Phase.PICK_PREOPEN:
+            # settle at the bottom so the object stops moving
+            self._tick += 1
+            if self._tick >= max(self._pregrasp_pause, 1):
                 self._phase = Phase.PICK_DWELL
                 self._tick = 0
             return
 
         if self._phase == Phase.PICK_DWELL:
-            self._set_gripper(FingersAction.CLOSE)
+            # target = object size minus a small clearance
+            target_width = max(0.0, self._obj_size - self._grasp_clearance)
+            self._ramp_gripper_to_width(target_width, self._grasp_close_step)
+
             self._tick += 1
             if self._tick >= self._grasp_dwell_ticks:
                 up = self._goal_from_xyzrpy(self._pick_xy[0], self._pick_xy[1], self._hover_z, self._rpy)
@@ -358,6 +444,13 @@ class PandaTaskLibrary(Node):
 
     # ---------- Task starters ----------
 
+    def _ramp_gripper_to_width(self, total_width_m: float, max_step_per_tick_m: float):
+        per_finger_target = max(0.0, min(0.5 * total_width_m, 0.04))  # ~Franka limit
+        cur = float(self._joint_targets[-2])  # assume symmetry
+        step = np.clip(per_finger_target - cur, -max_step_per_tick_m, max_step_per_tick_m)
+        new = cur + step
+        self._joint_targets[-2:] = [new, new]
+
     def _start_go(self, x: float, y: float, z: float, rpy_deg: List[float]):
         goal = self._goal_from_xyzrpy(x, y, z, rpy_deg)
         jt = self._safe_ik(goal)
@@ -394,8 +487,16 @@ class PandaTaskLibrary(Node):
             return
         self._jt_start = jt_hover.copy()
         self._jt_goal = jt_down.copy()
-        self._phase = Phase.PICK_DESCEND
+
+        self._set_gripper(FingersAction.OPEN)
+        if self._pub_fingers:
+            self._set_gripper_open_width(self._normal_open_width_m)
+        else:
+            self._set_gripper(FingersAction.OPEN)
+        self._phase = Phase.PICK_PREOPEN
         self._tick = 0
+        self._obj_size = size
+
 
     def _start_place(self, x: float, y: float, z: float, size: float):
         self._rpy = self._home_rpy
@@ -423,15 +524,68 @@ class PandaTaskLibrary(Node):
         self._phase = Phase.PLACE_DESCEND
         self._tick = 0
 
+    # ---------- Action callbacks ----------
+
+    def _goal_cb(self, goal_request: ManipTask.Goal) -> int:
+        with self._active_goal_lock:
+            if self._active_goal_handle is not None:
+                return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _cancel_cb(self, goal_handle) -> int:
+        with self._active_goal_lock:
+            if self._active_goal_handle != goal_handle:
+                return CancelResponse.REJECT
+        self._queue.clear()
+        self._phase = Phase.IDLE
+        self._status("ERR canceled")
+        self._action_done_evt.set()
+        return CancelResponse.ACCEPT
+
+    def _execute_cb(self, goal_handle):
+        cmd = goal_handle.request.command.strip()
+        with self._active_goal_lock:
+            self._active_goal_handle = goal_handle
+        self._action_done_evt.clear()
+
+        # route through the existing command parser
+        self._on_cmd(String(data=cmd))
+
+        while rclpy.ok():
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                res = ManipTask.Result()
+                res.result = f"Aborted: canceled {cmd}"
+                with self._active_goal_lock:
+                    self._active_goal_handle = None
+                return res
+            if self._action_done_evt.wait(timeout=0.01):
+                break
+
+        res = ManipTask.Result()
+        if self._last_status.lower().startswith("done"):
+            goal_handle.succeed()
+            res.result = f"Done: {cmd}"
+        else:
+            goal_handle.abort()
+            why = self._last_status if self._last_status else "unknown error"
+            res.result = f"Aborted: {why}"
+        with self._active_goal_lock:
+            self._active_goal_handle = None
+        return res
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = PandaTaskLibrary()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

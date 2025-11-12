@@ -1,27 +1,22 @@
-# Copyright (C) 2021 Bosch LLC CR, North America. All rights reserved.
-# This software may be modified and distributed under the terms of the
-# GNU Lesser General Public License v2.1 or any later version.
-
-import sys
-
-# ROS2 Python API libraries
+# runner.py
 import argparse, sys
 import rclpy
 from rclpy.utilities import remove_ros_args
+from rclpy.executors import MultiThreadedExecutor
 
-# Panda example imports
+# swap the import to the action-enabled node
+from .examples.panda_task_library import PandaTaskLibrary
 from .examples.panda_teleop_control import PandaTeleopControl
 from .examples.panda_follow_trajectory import PandaFollowTrajectory
 from .examples.panda_pick_n_place import PandaPickAndPlace
 from .examples.panda_pick_n_insert import PandaPickAndInsert
-from .examples.panda_task_library import PandaTaskLibrary
 
 def main(args=None):
     rclpy.init(args=args)
-    user_argv = remove_ros_args(sys.argv)[1:]  # drop program name
+    user_argv = remove_ros_args(sys.argv)[1:]
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--mode', required=True,
-                        choices=['follow','picknplace','pickninsert','teleop','tasklibrary'],)
+                        choices=['follow','picknplace','pickninsert','teleop','tasklibrary'])
     mode = parser.parse_args(user_argv).mode
 
     if mode == 'follow':
@@ -31,14 +26,19 @@ def main(args=None):
     elif mode == 'pickninsert':
         node = PandaPickAndInsert()
     elif mode == 'tasklibrary':
-        node = PandaTaskLibrary()
+        node = PandaTaskLibrary()  # this is now the ActionServer version
     else:
         node = PandaTeleopControl()
 
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
+    # use multithreaded executor so action execute + joint-state callbacks can run
+    exec = MultiThreadedExecutor(num_threads=2)
+    exec.add_node(node)
+    try:
+        exec.spin()
+    finally:
+        exec.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
